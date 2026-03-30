@@ -3,11 +3,11 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
+import matplotlib.pyplot as plt
+import numpy as np
 import os
 import csv
 import argparse
-import matplotlib.pyplot as plt
-import numpy as np
 from models.dla_simple import SimpleDLA
 
 # Class names for labeling
@@ -64,7 +64,42 @@ def fgsm_untargeted(model, x, label, eps):
 
     return x_adv.detach()
 
-# 3. Model Wrapping with Normalization
+# 3. Targeted PGD (Projected Gradient Descent) Attack Function
+def pgd_targeted(model, x, target, k, eps, eps_step):
+    """
+    model : the neural network
+    x : input image tensor
+    target : desired (wrong) class label
+    k : number of iterations (e.g., 10, 40)
+    eps : total perturbation budget
+    eps_step : step size per iteration
+    return : adversarial image x_adv
+    """
+    model.eval()
+    
+    # Initialize adversarial image (Same as original x for vanilla PGD)
+    x_adv = x.clone().detach()
+    target = target.to(x.device)
+    
+    for _ in range(k):
+        x_adv.requires_grad = True
+        logits = model(x_adv)
+        loss = F.cross_entropy(logits, target)
+        
+        model.zero_grad()
+        loss.backward()
+        
+        # Step: Move TOWARDS the target class (targeted)
+        grad = x_adv.grad.data
+        x_adv = x_adv.detach() - eps_step * grad.sign()
+        
+        # Projection: L_inf ball constraint
+        delta = torch.clamp(x_adv - x, min=-eps, max=eps)
+        x_adv = torch.clamp(x + delta, min=0.0, max=1.0)
+        
+    return x_adv.detach()
+
+# 4. Model Wrapping with Normalization
 class WrappedModel(nn.Module):
     def __init__(self, model, dataset_name):
         super(WrappedModel, self).__init__()
@@ -131,7 +166,7 @@ def load_data(dataset_name, batch_size=32):
     
     return torch.utils.data.DataLoader(testset, batch_size=batch_size, shuffle=False)
 
-def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_class=8):
+def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_class=8, k=10, alpha=0.01):
     device = 'cuda' if torch.cuda.is_available() else 'cpu'
     print(f"\n[Evaluating Dataset: {dataset_name.upper()} | Mode: {attack_mode.upper()}]")
     
@@ -159,7 +194,7 @@ def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_cla
     log_csv = os.path.join(result_dir, f'{dataset_name}_{attack_mode}_results.csv')
     with open(log_csv, 'w', newline='') as f:
         writer = csv.writer(f)
-        if attack_mode == 'targeted':
+        if 'untargeted' not in attack_mode:
             writer.writerow(['eps', 'clean_acc', 'adv_acc', 'target_success_rate'])
         else:
             writer.writerow(['eps', 'clean_acc', 'adv_acc'])
@@ -174,12 +209,11 @@ def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_cla
             print(f"Running {attack_mode} attack for eps={eps}...")
             
             for i, (inputs, targets) in enumerate(testloader):
-                if i >= 32: break # ~1000 images
+                if i >= 4: break # Limit to ~128 images for speed
                 
                 inputs, targets = inputs.to(device), targets.to(device)
                 
-                if attack_mode == 'targeted':
-                    # Filter out images that are already the target
+                if 'untargeted' not in attack_mode:
                     mask = (targets != target_class)
                     inputs, targets = inputs[mask], targets[mask]
                     if targets.size(0) == 0: continue
@@ -196,15 +230,17 @@ def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_cla
                 # Generate adversarial images
                 if attack_mode == 'targeted':
                     adv_inputs = fgsm_targeted(wrapped_model, inputs, target_labels, eps)
-                else:
+                elif attack_mode == 'untargeted':
                     adv_inputs = fgsm_untargeted(wrapped_model, inputs, targets, eps)
+                elif attack_mode == 'pgd_targeted':
+                    adv_inputs = pgd_targeted(wrapped_model, inputs, target_labels, k=k, eps=eps, eps_step=alpha)
                 
                 # Adversarial predictions
                 with torch.no_grad():
                     adv_outputs = wrapped_model(adv_inputs)
                     _, adv_predicted = adv_outputs.max(1)
                     adv_correct += adv_predicted.eq(targets).sum().item()
-                    if attack_mode == 'targeted':
+                    if 'untargeted' not in attack_mode:
                         targeted_success += adv_predicted.eq(target_labels).sum().item()
                 
                 if not samples_saved and eps > 0:
@@ -217,7 +253,7 @@ def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_cla
             clean_acc = 100. * correct / total
             adv_acc = 100. * adv_correct / total
             
-            if attack_mode == 'targeted':
+            if 'untargeted' not in attack_mode:
                 tsr = 100. * targeted_success / total
                 print(f"Eps {eps}: Clean={clean_acc:.2f}%, Adv={adv_acc:.2f}%, TSR={tsr:.2f}%")
                 writer.writerow([eps, clean_acc, adv_acc, tsr])
@@ -226,15 +262,17 @@ def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_cla
                 writer.writerow([eps, clean_acc, adv_acc])
 
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser(description='FGSM Attack Evaluation')
-    parser.add_argument('--mode', type=str, default='untargeted', choices=['targeted', 'untargeted'], help='Attack mode')
-    parser.add_argument('--target', type=int, default=8, help='Target class index (for targeted mode)')
+    parser = argparse.ArgumentParser(description='Adversarial Attack Evaluation')
+    parser.add_argument('--mode', type=str, default='untargeted', choices=['targeted', 'untargeted', 'pgd_targeted'], help='Attack mode')
+    parser.add_argument('--target', type=int, default=4, help='Target class index')
     parser.add_argument('--dataset', type=str, default='all', choices=['mnist', 'cifar10', 'all'], help='Dataset to evaluate')
+    parser.add_argument('--iters', type=int, default=10, help='Number of iterations for PGD')
+    parser.add_argument('--alpha', type=float, default=0.01, help='Step size for PGD')
     args = parser.parse_args()
     
-    eps_to_test = [0.0, 0.05, 0.1, 0.15, 0.2, 0.3]
+    eps_to_test = [1e-4, 0.05, 0.1, 0.15, 0.2, 0.3] 
     
     datasets = ['mnist', 'cifar10'] if args.dataset == 'all' else [args.dataset]
     
     for ds in datasets:
-        run_attack_eval(ds, eps_to_test, attack_mode=args.mode, target_class=args.target)
+        run_attack_eval(ds, eps_to_test, attack_mode=args.mode, target_class=args.target, k=args.iters, alpha=args.alpha)
