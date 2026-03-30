@@ -3,11 +3,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchvision
 import torchvision.transforms as transforms
-from torchvision.utils import save_image
 import os
 import csv
 import argparse
+import matplotlib.pyplot as plt
+import numpy as np
 from models.dla_simple import SimpleDLA
+
+# Class names for labeling
+CIFAR10_CLASSES = ('plane', 'car', 'bird', 'cat', 'deer', 'dog', 'frog', 'horse', 'ship', 'truck')
+MNIST_CLASSES = ('0', '1', '2', '3', '4', '5', '6', '7', '8', '9')
 
 # 1. Targeted FGSM Attack Function
 def fgsm_targeted(model, x, target, eps):
@@ -76,6 +81,39 @@ class WrappedModel(nn.Module):
     def forward(self, x):
         x = (x - self.mean) / self.std
         return self.model(x)
+
+def save_labeled_samples(inputs, adv_inputs, targets, adv_predicted, dataset_name, eps, sample_dir):
+    classes = CIFAR10_CLASSES if dataset_name == 'cifar10' else MNIST_CLASSES
+    num_samples = len(inputs)
+    
+    fig, axes = plt.subplots(2, num_samples, figsize=(num_samples * 2.5, 6))
+    if num_samples == 1:
+        axes = axes.reshape(2, 1)
+        
+    for i in range(num_samples):
+        # Original
+        img = inputs[i].cpu().permute(1, 2, 0).numpy()
+        if dataset_name == 'mnist':
+            axes[0, i].imshow(img, cmap='gray')
+        else:
+            axes[0, i].imshow(img)
+        axes[0, i].set_title(f"Org: {classes[targets[i]]}")
+        axes[0, i].axis('off')
+        
+        # Adversarial
+        adv_img = adv_inputs[i].cpu().permute(1, 2, 0).numpy()
+        if dataset_name == 'mnist':
+            axes[1, i].imshow(adv_img, cmap='gray')
+        else:
+            axes[1, i].imshow(adv_img)
+        axes[1, i].set_title(f"Adv: {classes[adv_predicted[i]]}")
+        axes[1, i].axis('off')
+    
+    plt.tight_layout()
+    save_path = os.path.join(sample_dir, f'{dataset_name}_eps_{eps}.png')
+    plt.savefig(save_path)
+    plt.close()
+    print(f"Saved labeled samples to {save_path}")
 
 def load_data(dataset_name, batch_size=32):
     if dataset_name == 'cifar10':
@@ -171,10 +209,9 @@ def run_attack_eval(dataset_name, eps_list, attack_mode='untargeted', target_cla
                 
                 if not samples_saved and eps > 0:
                     num_samples = min(8, inputs.size(0))
-                    comparison = torch.cat([inputs[:num_samples], adv_inputs[:num_samples]], dim=0)
-                    save_path = os.path.join(sample_dir, f'{dataset_name}_eps_{eps}.png')
-                    save_image(comparison, save_path, nrow=num_samples, normalize=False)
-                    print(f"Saved samples to {save_path}")
+                    save_labeled_samples(inputs[:num_samples], adv_inputs[:num_samples], 
+                                         targets[:num_samples], adv_predicted[:num_samples], 
+                                         dataset_name, eps, sample_dir)
                     samples_saved = True
             
             clean_acc = 100. * correct / total
