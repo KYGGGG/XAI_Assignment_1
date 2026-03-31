@@ -1,4 +1,4 @@
-# XAI Assignment #1: Adversarial Robustness of SimpleDLA
+# XAI Assignment #1: Adversarial Attack
 
 ## Project Structure
 
